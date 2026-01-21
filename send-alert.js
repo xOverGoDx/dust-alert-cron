@@ -3,7 +3,7 @@ const admin = require("firebase-admin");
 // ดึงกุญแจ
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
-// ใส่ databaseURL ของคุณลงไปตรงนี้ด้วย!
+// Database URL ของคุณ (ใส่ให้ถูกนะ!)
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   databaseURL: "https://cimd-4e4cc-default-rtdb.asia-southeast1.firebasedatabase.app"
@@ -13,11 +13,13 @@ async function checkDustAndSend() {
   const db = admin.database();
   
   try {
-    // 1. จำลองค่าฝุ่น (หรือไปดึง API จริงมาใส่ตรงนี้)
+    // 1. จำลองค่าฝุ่น
     const pm25 = 75; 
 
     if (pm25 > 50) {
-      // 2. ไปอ่านรายชื่อทุกคนจาก Database
+      console.log(`ค่าฝุ่น ${pm25} เกินกำหนด เริ่มทำงาน...`);
+
+      // 2. ดึงรายชื่อ
       const snapshot = await db.ref('tokens').once('value');
       
       if (!snapshot.exists()) {
@@ -25,21 +27,29 @@ async function checkDustAndSend() {
         return;
       }
 
-      const tokens = Object.keys(snapshot.val()); // ดึงเฉพาะรหัส Token ออกมา
+      const tokens = Object.keys(snapshot.val());
       console.log(`Found ${tokens.length} devices.`);
 
-      // 3. เตรียมข้อความ
-      const message = {
-        notification: {
-          title: '⚠️ เตือนภัยฝุ่น TU!',
-          body: `ขณะนี้ค่าฝุ่น PM2.5 สูงถึง ${pm25} µg/m³ โปรดสวมหน้ากาก`
-        },
-        tokens: tokens // ส่งหาทุกคนในลิสต์
-      };
+      // 3. วนลูปส่งทีละคน (แก้ปัญหา Error 404 /batch/)
+      for (const token of tokens) {
+          const message = {
+            notification: {
+              title: '⚠️ เตือนภัยฝุ่น TU!',
+              body: `ขณะนี้ค่าฝุ่น PM2.5 สูงถึง ${pm25} µg/m³ โปรดสวมหน้ากาก`
+            },
+            token: token // ระบุผู้รับทีละคน
+          };
 
-      // 4. ส่งข้อความ (Multicast)
-      const response = await admin.messaging().sendMulticast(message);
-      console.log(response.successCount + ' messages were sent successfully');
+          try {
+            await admin.messaging().send(message);
+            console.log(`✅ ส่งสำเร็จ: ${token.substring(0, 10)}...`);
+          } catch (err) {
+            console.log(`❌ ส่งไม่ผ่าน: ${token.substring(0, 10)}...`, err.message);
+            // ถ้า Token หมดอายุหรือ Error ก็ข้ามไปคนต่อไป
+          }
+      }
+      
+      console.log("จบการทำงาน");
     }
   } catch (error) {
     console.log('Error:', error);
