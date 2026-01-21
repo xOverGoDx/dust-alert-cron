@@ -1,0 +1,29 @@
+name: Dust Alert Scheduler
+
+on:
+  schedule:
+    # ตั้งเวลาทุก 10 นาที (ไวยากรณ์ cron)
+    - cron: '*/10 * * * *'
+  # เพื่อให้กดรันมือทดสอบได้ด้วย
+  workflow_dispatch:
+
+jobs:
+  run-dust-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run Alert Script
+        env:
+          # ส่งกุญแจเข้าไปในสคริปต์
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: node send-alert.js
