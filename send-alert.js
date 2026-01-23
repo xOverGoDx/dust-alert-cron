@@ -1,60 +1,104 @@
 const admin = require("firebase-admin");
 
-// ดึงกุญแจ
+// 1. Setup Firebase Admin
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
-// Database URL ของคุณ (ใส่ให้ถูกนะ!)
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: "https://cimd-4e4cc-default-rtdb.asia-southeast1.firebasedatabase.app"
+  credential: admin.credential.cert(serviceAccount)
 });
 
-async function checkDustAndSend() {
-  const db = admin.database();
-  
+const db = admin.firestore();
+
+async function checkAndSendNotifications() {
   try {
-    // 1. จำลองค่าฝุ่น
-    const pm25 = 75; 
+    console.log("🔍 บอทเริ่มทำงาน: ตรวจหาการแจ้งเตือน...");
 
-    if (pm25 > 50) {
-      console.log(`ค่าฝุ่น ${pm25} เกินกำหนด เริ่มทำงาน...`);
+    // 2. หา Notification ที่ยังไม่ได้ส่ง (pushed: false)
+    const snapshot = await db.collection('notifications')
+                             .where('pushed', '==', false)
+                             .get();
 
-      // 2. ดึงรายชื่อ
-      const snapshot = await db.ref('tokens').once('value');
-      
-      if (!snapshot.exists()) {
-        console.log("No tokens found.");
-        return;
-      }
-
-      const tokens = Object.keys(snapshot.val());
-      console.log(`Found ${tokens.length} devices.`);
-
-      // 3. วนลูปส่งทีละคน (แก้ปัญหา Error 404 /batch/)
-      for (const token of tokens) {
-          const message = {
-            notification: {
-              title: '⚠️ เตือนภัยฝุ่น TU!',
-              body: `ขณะนี้ค่าฝุ่น PM2.5 สูงถึง ${pm25} µg/m³ โปรดสวมหน้ากาก`
-            },
-            token: token // ระบุผู้รับทีละคน
-          };
-
-          try {
-            await admin.messaging().send(message);
-            console.log(`✅ ส่งสำเร็จ: ${token.substring(0, 10)}...`);
-          } catch (err) {
-            console.log(`❌ ส่งไม่ผ่าน: ${token.substring(0, 10)}...`, err.message);
-            // ถ้า Token หมดอายุหรือ Error ก็ข้ามไปคนต่อไป
-          }
-      }
-      
-      console.log("จบการทำงาน");
+    if (snapshot.empty) {
+      console.log("✅ ไม่มีการแจ้งเตือนใหม่");
+      return;
     }
+
+    console.log(`เจอ ${snapshot.size} รายการที่ต้องส่ง`);
+
+    // 3. วนลูปส่งทีละรายการ
+    for (const doc of snapshot.docs) {
+      const notiData = doc.data();
+      const targetUserId = notiData.toUserId; 
+      
+      // ดึงข้อมูลที่จะแสดง
+      const title = notiData.title || "TUwork แจ้งเตือน";
+      const body = notiData.message || "คุณมีการแจ้งเตือนใหม่";
+      const link = notiData.link || "/"; // ลิ้งค์เผื่อมี
+
+      if (!targetUserId) {
+        console.log(`⚠️ ข้าม: ไม่ระบุ toUserId (Doc ID: ${doc.id})`);
+        continue;
+      }
+
+      // 4. ไปดึง Token จาก Users Collection
+      const userDoc = await db.collection('users').doc(targetUserId).get();
+      
+      if (!userDoc.exists) {
+        console.log(`❌ ไม่พบ User ID: ${targetUserId}`);
+        await doc.ref.update({ pushed: true, pushError: 'User Not Found' });
+        continue;
+      }
+
+      const userData = userDoc.data();
+      
+      // *** จุดสำคัญ: อ่าน fcmTokens (Array) ***
+      const tokens = userData.fcmTokens || []; 
+
+      if (tokens.length === 0) {
+        console.log(`❌ User ${targetUserId} ยังไม่เปิดแจ้งเตือน (ไม่มี Token)`);
+        await doc.ref.update({ pushed: true, pushError: 'No Tokens' });
+        continue;
+      }
+
+      console.log(`📤 กำลังส่งหา ${targetUserId} (จำนวน ${tokens.length} เครื่อง)...`);
+
+      // 5. ส่งหาทุกเครื่องของ User นั้น (มือถือ + คอม)
+      const sendPromises = tokens.map(token => {
+        const message = {
+          notification: {
+            title: title,
+            body: body
+          },
+          data: {
+             url: link, // ส่งลิ้งค์ไปด้วย (ให้ SW จัดการเปิด)
+             tag: 'tuwork-alert' 
+          },
+          token: token
+        };
+        return admin.messaging().send(message)
+          .catch(err => {
+             console.log(`   - ส่งไม่ผ่านเครื่องนึง: ${err.message}`);
+             // อนาคตอาจจะเขียนโค้ดลบ Token ที่ตายแล้วออกตรงนี้ได้
+             return null; 
+          });
+      });
+
+      await Promise.all(sendPromises);
+      console.log(`✅ ส่งครบทุกเครื่องแล้ว`);
+
+      // 6. อัปเดตสถานะว่าส่งแล้ว
+      await doc.ref.update({ 
+          pushed: true,
+          pushedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+    
+    console.log("จบการทำงาน");
+
   } catch (error) {
-    console.log('Error:', error);
+    console.error('System Error:', error);
     process.exit(1);
   }
 }
 
-checkDustAndSend();
+checkAndSendNotifications();
