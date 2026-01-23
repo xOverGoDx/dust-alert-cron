@@ -1,6 +1,5 @@
 const admin = require("firebase-admin");
 
-// 1. Setup Firebase Admin
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 admin.initializeApp({
@@ -11,89 +10,90 @@ const db = admin.firestore();
 
 async function checkAndSendNotifications() {
   try {
-    console.log("🔍 บอทเริ่มทำงาน: ตรวจหาการแจ้งเตือน...");
+    console.log("🔍 บอทเริ่มทำงาน: สแกนหาการแจ้งเตือนล่าสุด...");
 
-    // 2. หา Notification ที่ยังไม่ได้ส่ง (pushed: false)
+    // --- แก้ไข Logic: อ่าน 50 รายการล่าสุด โดยไม่สนว่ามี field pushed ไหม ---
+    // (ต้องมั่นใจว่าใน Database มี field 'createdAt' นะครับ ถ้าไม่มีให้เอา .orderBy ออก)
     const snapshot = await db.collection('notifications')
-                             .where('pushed', '==', false)
+                             .orderBy('createdAt', 'desc') 
+                             .limit(50) 
                              .get();
 
     if (snapshot.empty) {
-      console.log("✅ ไม่มีการแจ้งเตือนใหม่");
+      console.log("✅ ไม่พบข้อมูลการแจ้งเตือนเลย");
       return;
     }
 
-    console.log(`เจอ ${snapshot.size} รายการที่ต้องส่ง`);
+    console.log(`สแกนเจอ ${snapshot.size} รายการล่าสุด... กำลังคัดกรอง`);
 
-    // 3. วนลูปส่งทีละรายการ
+    let sentCount = 0;
+
     for (const doc of snapshot.docs) {
       const notiData = doc.data();
-      const targetUserId = notiData.toUserId; 
       
-      // ดึงข้อมูลที่จะแสดง
-      const title = notiData.title || "TUwork แจ้งเตือน";
-      const body = notiData.message || "คุณมีการแจ้งเตือนใหม่";
-      const link = notiData.link || "/"; // ลิ้งค์เผื่อมี
-
-      if (!targetUserId) {
-        console.log(`⚠️ ข้าม: ไม่ระบุ toUserId (Doc ID: ${doc.id})`);
+      // 1. เช็คว่าส่งไปหรือยัง? (ถ้ามี field pushed = true แปลว่าส่งแล้ว ให้ข้าม)
+      if (notiData.pushed === true) {
         continue;
       }
 
-      // 4. ไปดึง Token จาก Users Collection
+      const targetUserId = notiData.toUserId;
+      if (!targetUserId) continue;
+
+      console.log(`>>> พบรายการใหม่! (ID: ${doc.id}) เตรียมส่งหา ${targetUserId}`);
+
+      // 2. ดึง Token
       const userDoc = await db.collection('users').doc(targetUserId).get();
-      
       if (!userDoc.exists) {
-        console.log(`❌ ไม่พบ User ID: ${targetUserId}`);
+        console.log(`   ❌ ไม่พบข้อมูล User ${targetUserId} ในระบบ`);
+        // มาร์คว่า processed เพื่อไม่ให้วนมาเจออีก
         await doc.ref.update({ pushed: true, pushError: 'User Not Found' });
         continue;
       }
 
+      // รองรับทั้ง fcmToken (ตัวเดียว) และ fcmTokens (Array)
       const userData = userDoc.data();
-      
-      // *** จุดสำคัญ: อ่าน fcmTokens (Array) ***
-      const tokens = userData.fcmTokens || []; 
+      let tokens = [];
+      if (userData.fcmTokens && Array.isArray(userData.fcmTokens)) {
+        tokens = userData.fcmTokens;
+      } else if (userData.fcmToken) {
+        tokens = [userData.fcmToken];
+      }
 
       if (tokens.length === 0) {
-        console.log(`❌ User ${targetUserId} ยังไม่เปิดแจ้งเตือน (ไม่มี Token)`);
+        console.log(`   ⚠️ User นี้ยังไม่เปิดรับแจ้งเตือน (ไม่มี Token)`);
         await doc.ref.update({ pushed: true, pushError: 'No Tokens' });
         continue;
       }
 
-      console.log(`📤 กำลังส่งหา ${targetUserId} (จำนวน ${tokens.length} เครื่อง)...`);
+      // 3. ส่ง Push Notification
+      const title = notiData.title || "TUwork แจ้งเตือน";
+      const body = notiData.message || "มีข้อความใหม่ถึงคุณ";
+      const link = notiData.link || "/notifications";
 
-      // 5. ส่งหาทุกเครื่องของ User นั้น (มือถือ + คอม)
       const sendPromises = tokens.map(token => {
-        const message = {
-          notification: {
-            title: title,
-            body: body
-          },
-          data: {
-             url: link, // ส่งลิ้งค์ไปด้วย (ให้ SW จัดการเปิด)
-             tag: 'tuwork-alert' 
-          },
+        return admin.messaging().send({
+          notification: { title, body },
+          data: { url: link, tag: 'tuwork' },
           token: token
-        };
-        return admin.messaging().send(message)
-          .catch(err => {
-             console.log(`   - ส่งไม่ผ่านเครื่องนึง: ${err.message}`);
-             // อนาคตอาจจะเขียนโค้ดลบ Token ที่ตายแล้วออกตรงนี้ได้
-             return null; 
-          });
+        }).catch(e => {
+            console.log(`   - Token ตาย/ผิดพลาด: ${e.message}`);
+            return null;
+        });
       });
 
       await Promise.all(sendPromises);
-      console.log(`✅ ส่งครบทุกเครื่องแล้ว`);
+      console.log(`   ✅ ส่งสำเร็จ! (${tokens.length} อุปกรณ์)`);
 
-      // 6. อัปเดตสถานะว่าส่งแล้ว
+      // 4. ประทับตราว่าส่งแล้ว (สำคัญมาก!)
       await doc.ref.update({ 
-          pushed: true,
-          pushedAt: admin.firestore.FieldValue.serverTimestamp()
+        pushed: true,
+        pushedAt: admin.firestore.FieldValue.serverTimestamp()
       });
+      
+      sentCount++;
     }
-    
-    console.log("จบการทำงาน");
+
+    console.log(`สรุป: ส่งแจ้งเตือนใหม่ไปทั้งหมด ${sentCount} รายการ`);
 
   } catch (error) {
     console.error('System Error:', error);
